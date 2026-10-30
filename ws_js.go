@@ -210,6 +210,16 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, p []byte) error {
 	return nil
 }
 
+// WriteCompression is always CompressionDisabled, as the browser owns compression.
+func (c *Conn) WriteCompression() CompressionMode {
+	return CompressionDisabled
+}
+
+// WriteDeflated always errors, as the browser owns compression.
+func (c *Conn) WriteDeflated(ctx context.Context, typ MessageType, parts ...[]byte) error {
+	return errors.New("websocket: WriteDeflated is not supported in Wasm")
+}
+
 func (c *Conn) write(typ MessageType, p []byte) error {
 	if c.isClosed() {
 		return net.ErrClosed

@@ -29,6 +29,7 @@ go get github.com/coder/websocket
 - [net.Conn](https://pkg.go.dev/github.com/coder/websocket#NetConn) wrapper
 - [Ping pong](https://pkg.go.dev/github.com/coder/websocket#Conn.Ping) API
 - [RFC 7692](https://tools.ietf.org/html/rfc7692) permessage-deflate compression
+- [Caller-compressed writes](https://pkg.go.dev/github.com/coder/websocket#Conn.WriteDeflated) to compress a broadcast once
 - [CloseRead](https://pkg.go.dev/github.com/coder/websocket#Conn.CloseRead) helper for write only connections
 - Compile to [Wasm](https://pkg.go.dev/github.com/coder/websocket#hdr-Wasm)
 
