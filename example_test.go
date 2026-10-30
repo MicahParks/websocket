@@ -1,9 +1,13 @@
 package websocket_test
 
 import (
+	"bytes"
+	"compress/flate"
 	"context"
+	"io"
 	"log"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/coder/websocket"
@@ -158,6 +162,45 @@ func ExampleConn_Ping() {
 	}
 
 	c.Close(websocket.StatusNormalClosure, "")
+}
+
+func ExampleConn_WriteDeflated() {
+	// Broadcasts a part every connection receives, compressed once, followed
+	// by a part compressed for each connection alone.
+
+	var conns []*websocket.Conn
+	shared := []byte("the part every connection receives")
+	own := func(c *websocket.Conn) []byte {
+		return []byte("the part this connection alone receives")
+	}
+
+	// Each part is a DEFLATE stream ending in a sync flush, so the parts
+	// joined inflate as one message.
+	fw, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
+	var sharedBuf, ownBuf bytes.Buffer
+	deflate := func(buf *bytes.Buffer, p []byte) []byte {
+		buf.Reset()
+		fw.Reset(buf)
+		fw.Write(p)
+		fw.Flush()
+		return buf.Bytes()
+	}
+	sharedDeflated := deflate(&sharedBuf, shared)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	for _, c := range conns {
+		var err error
+		if c.WriteCompression() == websocket.CompressionNoContextTakeover {
+			err = c.WriteDeflated(ctx, websocket.MessageBinary, sharedDeflated, deflate(&ownBuf, own(c)))
+		} else {
+			err = c.Write(ctx, websocket.MessageBinary, slices.Concat(shared, own(c)))
+		}
+		if err != nil {
+			log.Println(err)
+		}
+	}
 }
 
 // This example demonstrates full stack chat with an automated test.

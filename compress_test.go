@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -308,4 +309,317 @@ func TestCompressionDictionaryPreserved(t *testing.T) {
 		t.Errorf("context takeover should compress better: with=%d, without=%d",
 			withTakeoverSizes[2], withoutTakeoverSizes[2])
 	}
+}
+
+// deflateSync compresses p as a DEFLATE stream ending in a sync flush, as a
+// caller of Conn.WriteDeflated produces one.
+func deflateSync(t testing.TB, p []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	fw, err := flate.NewWriter(&buf, flate.BestSpeed)
+	assert.Success(t, err)
+	_, err = fw.Write(p)
+	assert.Success(t, err)
+	assert.Success(t, fw.Flush())
+	return buf.Bytes()
+}
+
+// pipeConns returns a client and a server joined by net.Pipe, both with
+// copts, closed when the test ends.
+func pipeConns(t testing.TB, copts *compressionOptions) (client, server *Conn) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		clientConn.Close()
+		serverConn.Close()
+	})
+	client = newConn(connConfig{
+		rwc:            clientConn,
+		client:         true,
+		copts:          copts,
+		flateThreshold: 64,
+		br:             bufio.NewReader(clientConn),
+		bw:             bufio.NewWriterSize(clientConn, 4096),
+	})
+	server = newConn(connConfig{
+		rwc:            serverConn,
+		client:         false,
+		copts:          copts,
+		flateThreshold: 64,
+		br:             bufio.NewReader(serverConn),
+		bw:             bufio.NewWriterSize(serverConn, 4096),
+	})
+	return client, server
+}
+
+// TestWriteDeflated verifies that the peer reads back what the caller
+// compressed, from either side, in one part, as a prefix compressed once with
+// a suffix per message, with the sync flush tail split across parts, and
+// followed by a regular Write.
+func TestWriteDeflated(t *testing.T) {
+	t.Parallel()
+
+	msg := []byte(strings.Repeat("hello world ", 100))
+	shared := []byte(strings.Repeat("shared state ", 100))
+	suffixes := [][]byte{
+		[]byte(strings.Repeat("first ", 20)),
+		[]byte(strings.Repeat("second ", 20)),
+	}
+
+	testCases := []struct {
+		name  string
+		typ   MessageType
+		write func(t *testing.T, ctx context.Context, c *Conn)
+		want  [][]byte
+	}{
+		{"OnePart", MessageBinary, func(t *testing.T, ctx context.Context, c *Conn) {
+			assert.Success(t, c.WriteDeflated(ctx, MessageBinary, deflateSync(t, msg)))
+		}, [][]byte{msg}},
+		{"SharedPrefix", MessageText, func(t *testing.T, ctx context.Context, c *Conn) {
+			prefix := deflateSync(t, shared)
+			for _, suffix := range suffixes {
+				assert.Success(t, c.WriteDeflated(ctx, MessageText, prefix, deflateSync(t, suffix)))
+			}
+			// The parts are the caller's to reuse.
+			assert.Equal(t, "prefix", string(deflateSync(t, shared)), string(prefix))
+		}, [][]byte{slices.Concat(shared, suffixes[0]), slices.Concat(shared, suffixes[1])}},
+		{"TailSplit", MessageBinary, func(t *testing.T, ctx context.Context, c *Conn) {
+			stream := deflateSync(t, msg)
+			n := len(stream)
+			assert.Success(t, c.WriteDeflated(ctx, MessageBinary, stream[:n-2], nil, stream[n-2:n-1], stream[n-1:]))
+		}, [][]byte{msg}},
+		{"ThenWrite", MessageBinary, func(t *testing.T, ctx context.Context, c *Conn) {
+			assert.Success(t, c.WriteDeflated(ctx, MessageBinary, deflateSync(t, msg)))
+			assert.Success(t, c.Write(ctx, MessageBinary, msg))
+		}, [][]byte{msg, msg}},
+	}
+
+	for _, side := range []string{"server", "client"} {
+		for _, tc := range testCases {
+			t.Run(side+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				client, server := pipeConns(t, CompressionNoContextTakeover.opts())
+				w, r := server, client
+				if side == "client" {
+					w, r = client, server
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+
+				type readResult struct {
+					typ MessageType
+					p   []byte
+					err error
+				}
+				readCh := make(chan readResult, len(tc.want))
+				go func() {
+					for range tc.want {
+						typ, p, err := r.Read(ctx)
+						readCh <- readResult{typ, p, err}
+					}
+				}()
+
+				tc.write(t, ctx, w)
+
+				for _, want := range tc.want {
+					got := <-readCh
+					assert.Success(t, got.err)
+					assert.Equal(t, "type", tc.typ, got.typ)
+					if !bytes.Equal(want, got.p) {
+						t.Fatalf("read %d bytes, want %d", len(got.p), len(want))
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestWriteDeflatedRefused(t *testing.T) {
+	t.Parallel()
+
+	stream := deflateSync(t, []byte(strings.Repeat("hello world ", 100)))
+
+	testCases := []struct {
+		name  string
+		copts *compressionOptions
+		parts [][]byte
+		want  string
+	}{
+		{"CompressionDisabled", nil, [][]byte{stream}, "without context takeover"},
+		{"ContextTakeover", CompressionContextTakeover.opts(), [][]byte{stream}, "without context takeover"},
+		{"NoTail", CompressionNoContextTakeover.opts(), [][]byte{stream[:len(stream)-4]}, "sync flush"},
+		{"Short", CompressionNoContextTakeover.opts(), [][]byte{stream[:2], nil}, "sync flush"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, server := pipeConns(t, tc.copts)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+			defer cancel()
+
+			err := server.WriteDeflated(ctx, MessageBinary, tc.parts...)
+			assert.Error(t, err)
+			assert.Contains(t, err, tc.want)
+		})
+	}
+}
+
+// TestWriteDeflatedFrame verifies the frame on the wire: one final frame with
+// rsv1 set, the tail removed, and on a client the masking key carried across
+// parts whose lengths are not multiples of four.
+func TestWriteDeflatedFrame(t *testing.T) {
+	t.Parallel()
+
+	stream := deflateSync(t, []byte(strings.Repeat("hello world ", 100)))
+	payload := stream[:len(stream)-4]
+
+	for _, client := range []bool{false, true} {
+		name := "server"
+		if client {
+			name = "client"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			writerConn, peerConn := net.Pipe()
+			defer writerConn.Close()
+			defer peerConn.Close()
+
+			c := newConn(connConfig{
+				rwc:    writerConn,
+				client: client,
+				copts:  CompressionNoContextTakeover.opts(),
+				br:     bufio.NewReader(writerConn),
+				bw:     bufio.NewWriterSize(writerConn, 4096),
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			writeDone := make(chan error, 1)
+			go func() {
+				writeDone <- c.WriteDeflated(ctx, MessageText, stream[:5], stream[5:11], stream[11:])
+			}()
+
+			reader := bufio.NewReader(peerConn)
+			h, err := readFrameHeader(reader, make([]byte, 8))
+			assert.Success(t, err)
+			assert.Equal(t, "fin", true, h.fin)
+			assert.Equal(t, "rsv1", true, h.rsv1)
+			assert.Equal(t, "opcode", opText, h.opcode)
+			assert.Equal(t, "masked", client, h.masked)
+			assert.Equal(t, "payload length", int64(len(payload)), h.payloadLength)
+
+			got := make([]byte, h.payloadLength)
+			_, err = io.ReadFull(reader, got)
+			assert.Success(t, err)
+			if h.masked {
+				mask(got, h.maskKey)
+			}
+			if !bytes.Equal(payload, got) {
+				t.Fatal("payload differs from the stream without its tail")
+			}
+
+			assert.Success(t, <-writeDone)
+		})
+	}
+}
+
+func TestWriteCompression(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name           string
+		copts          *compressionOptions
+		client, server CompressionMode
+	}{
+		{"Disabled", nil, CompressionDisabled, CompressionDisabled},
+		{"ContextTakeover", CompressionContextTakeover.opts(), CompressionContextTakeover, CompressionContextTakeover},
+		{"NoContextTakeover", CompressionNoContextTakeover.opts(), CompressionNoContextTakeover, CompressionNoContextTakeover},
+		{"ClientNoContextTakeover", &compressionOptions{clientNoContextTakeover: true}, CompressionNoContextTakeover, CompressionContextTakeover},
+		{"ServerNoContextTakeover", &compressionOptions{serverNoContextTakeover: true}, CompressionContextTakeover, CompressionNoContextTakeover},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, server := pipeConns(t, tc.copts)
+			assert.Equal(t, "client", tc.client, client.WriteCompression())
+			assert.Equal(t, "server", tc.server, server.WriteCompression())
+		})
+	}
+}
+
+// BenchmarkWriteDeflated broadcasts a shared prefix with a suffix per
+// connection to 16 server connections compressing without context takeover.
+// Write compresses prefix and suffix per connection; WriteDeflated compresses
+// the prefix once and the suffix per connection.
+func BenchmarkWriteDeflated(b *testing.B) {
+	const conns = 16
+
+	prefix := []byte(strings.Repeat("shared state ", 80))
+	suffix := []byte(strings.Repeat("mine ", 16))
+
+	ctx := context.Background()
+	writers := make([]*Conn, conns)
+	for i := range writers {
+		clientConn, serverConn := net.Pipe()
+		b.Cleanup(func() {
+			clientConn.Close()
+			serverConn.Close()
+		})
+		writers[i] = newConn(connConfig{
+			rwc:   serverConn,
+			copts: CompressionNoContextTakeover.opts(),
+			br:    bufio.NewReader(serverConn),
+			bw:    bufio.NewWriterSize(io.Discard, 4096),
+		})
+	}
+
+	b.Run("write", func(b *testing.B) {
+		msg := make([]byte, 0, len(prefix)+len(suffix))
+		b.SetBytes(int64((len(prefix) + len(suffix)) * conns))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			msg = append(append(msg[:0], prefix...), suffix...)
+			for _, c := range writers {
+				err := c.Write(ctx, MessageBinary, msg)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	b.Run("writeDeflated", func(b *testing.B) {
+		var prefixBuf, suffixBuf bytes.Buffer
+		fw, err := flate.NewWriter(io.Discard, flate.BestSpeed)
+		if err != nil {
+			b.Fatal(err)
+		}
+		deflate := func(buf *bytes.Buffer, p []byte) []byte {
+			buf.Reset()
+			fw.Reset(buf)
+			fw.Write(p)
+			fw.Flush()
+			return buf.Bytes()
+		}
+		b.SetBytes(int64((len(prefix) + len(suffix)) * conns))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			shared := deflate(&prefixBuf, prefix)
+			for _, c := range writers {
+				err := c.WriteDeflated(ctx, MessageBinary, shared, deflate(&suffixBuf, suffix))
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }

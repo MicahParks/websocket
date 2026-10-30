@@ -48,6 +48,61 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, p []byte) error {
 	return nil
 }
 
+// WriteCompression returns the compression mode of the messages this side
+// writes: CompressionDisabled when the peer negotiated no compression,
+// otherwise the mode of this direction alone, as the peer may negotiate no
+// context takeover for one direction only.
+func (c *Conn) WriteCompression() CompressionMode {
+	if !c.flate() {
+		return CompressionDisabled
+	}
+	if c.msgWriter.flateContextTakeover() {
+		return CompressionContextTakeover
+	}
+	return CompressionNoContextTakeover
+}
+
+// WriteDeflated writes a message the caller compressed, such as a broadcast
+// compressed once for every connection, or a prefix compressed once with a
+// suffix compressed per connection. The parts joined must be a raw DEFLATE
+// stream ending in a sync flush, as flate.Writer then Flush produce. It is
+// written as one frame with the trailing 0x00 0x00 0xff 0xff removed, per
+// RFC 7692 section 7.2.1, without copying the parts together. Only that tail
+// is checked; a malformed stream fails on the peer.
+//
+// It errors unless WriteCompression is CompressionNoContextTakeover: with
+// context takeover the peer inflates against the window of this connection's
+// own compression, and without compression the peer cannot inflate.
+func (c *Conn) WriteDeflated(ctx context.Context, typ MessageType, parts ...[]byte) error {
+	err := c.writeDeflated(ctx, typ, parts)
+	if err != nil {
+		return fmt.Errorf("failed to write deflated msg: %w", err)
+	}
+	return nil
+}
+
+func (c *Conn) writeDeflated(ctx context.Context, typ MessageType, parts [][]byte) error {
+	if c.WriteCompression() != CompressionNoContextTakeover {
+		return errors.New("writes are not compressed without context takeover")
+	}
+	if !endsInDeflateTail(parts) {
+		return errors.New("deflated message does not end in a sync flush")
+	}
+	n := -len(deflateMessageTail)
+	for _, p := range parts {
+		n += len(p)
+	}
+
+	err := c.msgWriter.reset(ctx, typ)
+	if err != nil {
+		return err
+	}
+	defer c.msgWriter.mu.unlock()
+
+	_, err = c.writeFrameParts(ctx, true, true, c.msgWriter.opcode, n, parts...)
+	return err
+}
+
 type msgWriter struct {
 	c *Conn
 
@@ -284,8 +339,14 @@ func (c *Conn) writeControl(ctx context.Context, opcode opcode, p []byte) error 
 	return nil
 }
 
-// writeFrame handles all writes to the connection.
-func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opcode, p []byte) (_ int, err error) {
+func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opcode, p []byte) (int, error) {
+	return c.writeFrameParts(ctx, fin, flate, opcode, len(p), p)
+}
+
+// writeFrameParts handles all writes to the connection: one frame whose
+// payload is the first n bytes of parts joined, so bytes shared between
+// connections are never copied.
+func (c *Conn) writeFrameParts(ctx context.Context, fin bool, flate bool, opcode opcode, n int, parts ...[]byte) (_ int, err error) {
 	err = c.writeFrameMu.lock(ctx)
 	if err != nil {
 		return 0, err
@@ -324,7 +385,7 @@ func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opco
 
 	c.writeHeader.fin = fin
 	c.writeHeader.opcode = opcode
-	c.writeHeader.payloadLength = int64(len(p))
+	c.writeHeader.payloadLength = int64(n)
 
 	if c.client {
 		c.writeHeader.masked = true
@@ -345,15 +406,21 @@ func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opco
 		return 0, err
 	}
 
-	n, err := c.writeFramePayload(p)
-	if err != nil {
-		return n, err
+	written, maskKey := 0, c.writeHeader.maskKey
+	for _, p := range parts {
+		p = p[:min(len(p), n-written)]
+		var m int
+		m, maskKey, err = c.writeFramePayload(p, maskKey)
+		written += m
+		if err != nil {
+			return written, err
+		}
 	}
 
 	if c.writeHeader.fin {
 		err = c.bw.Flush()
 		if err != nil {
-			return n, fmt.Errorf("failed to flush: %w", err)
+			return written, fmt.Errorf("failed to flush: %w", err)
 		}
 	}
 
@@ -369,23 +436,25 @@ func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opco
 		}
 	}
 
-	return n, nil
+	return written, nil
 }
 
-func (c *Conn) writeFramePayload(p []byte) (n int, err error) {
+// writeFramePayload writes p, masked with maskKey on a masked frame, and
+// returns the key for the bytes that follow p in the frame.
+func (c *Conn) writeFramePayload(p []byte, maskKey uint32) (n int, _ uint32, err error) {
 	defer errd.Wrap(&err, "failed to write frame payload")
 
 	if !c.writeHeader.masked {
-		return c.bw.Write(p)
+		n, err = c.bw.Write(p)
+		return n, maskKey, err
 	}
 
-	maskKey := c.writeHeader.maskKey
 	for len(p) > 0 {
 		// If the buffer is full, we need to flush.
 		if c.bw.Available() == 0 {
 			err = c.bw.Flush()
 			if err != nil {
-				return n, err
+				return n, maskKey, err
 			}
 		}
 
@@ -396,7 +465,7 @@ func (c *Conn) writeFramePayload(p []byte) (n int, err error) {
 
 		_, err := c.bw.Write(p[:j])
 		if err != nil {
-			return n, err
+			return n, maskKey, err
 		}
 
 		maskKey = mask(c.writeBuf[i:c.bw.Buffered()], maskKey)
@@ -405,7 +474,7 @@ func (c *Conn) writeFramePayload(p []byte) (n int, err error) {
 		n += j
 	}
 
-	return n, nil
+	return n, maskKey, nil
 }
 
 // extractBufioWriterBuf grabs the []byte backing a *bufio.Writer
