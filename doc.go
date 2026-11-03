@@ -28,6 +28,7 @@
 //   - Accept always errors out
 //   - Conn.Ping is no-op
 //   - Conn.CloseNow is Close(StatusGoingAway, "")
+//   - Conn.WriteCompression is CompressionDisabled and Conn.WriteDeflated always errors out
 //   - HTTPClient, HTTPHeader and CompressionMode in DialOptions are no-op
 //   - *http.Response from Dial is &http.Response{} with a 101 status code on success
 package websocket // import "github.com/coder/websocket"
