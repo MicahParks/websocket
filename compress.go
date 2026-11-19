@@ -45,6 +45,9 @@ const (
 	//
 	// Thus, it uses less memory than CompressionContextTakeover but compresses less efficiently.
 	//
+	// Conn.WriteDeflated can write a message the caller compressed, such as a broadcast
+	// compressed once for every connection.
+	//
 	// If the peer does not support CompressionNoContextTakeover then we will fall back to CompressionDisabled.
 	CompressionNoContextTakeover
 )
@@ -78,6 +81,21 @@ func (copts *compressionOptions) String() string {
 // we need to add them back otherwise flate.Reader keeps
 // trying to read more bytes.
 const deflateMessageTail = "\x00\x00\xff\xff"
+
+// endsInDeflateTail reports whether parts joined end in the sync flush of a
+// DEFLATE stream, the four octets RFC 7692 section 7.2.1 has the sender
+// remove.
+func endsInDeflateTail(parts [][]byte) bool {
+	var tail [len(deflateMessageTail)]byte
+	n := len(tail)
+	for i := len(parts) - 1; i >= 0 && n > 0; i-- {
+		p := parts[i]
+		k := min(n, len(p))
+		copy(tail[n-k:], p[len(p)-k:])
+		n -= k
+	}
+	return n == 0 && string(tail[:]) == deflateMessageTail
+}
 
 type trimLastFourBytesWriter struct {
 	w    io.Writer
